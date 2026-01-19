@@ -101,6 +101,7 @@ def italy_public_holidays(year: int) -> Set[dt.date]:
         dt.date(year, 4, 25),  # Liberazione
         dt.date(year, 5, 1),   # Lavoro
         dt.date(year, 6, 2),   # Repubblica
+        dt.date(year, 6, 3),   # Madonna della Lettera
         dt.date(year, 8, 15),  # Ferragosto
         dt.date(year, 11, 1),  # Ognissanti
         dt.date(year, 12, 8),  # Immacolata
