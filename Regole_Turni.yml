@@ -244,7 +244,7 @@ rules:
     # Spaziatura: almeno 2 giorni tra due reperibilita dello stesso medico (no consecutivi)
     spacing_min_days: 2
     # Preferenza (soft): cerca di distanziare le reperibilita nel mese (~1 settimana)
-    spacing_preferred_days: 7
+    spacing_preferred_days: 4
     excluded:
     - Zito
     - Manganaro
