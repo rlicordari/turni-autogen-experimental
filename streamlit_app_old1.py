@@ -32,8 +32,8 @@ st.markdown(
 /* Tidy up spacing */
 .block-container { padding-top: 1.2rem; padding-bottom: 2.5rem; }
 h1 { margin-bottom: 0.2rem; }
- .small-muted { opacity: 0.75; font-size: 0.92rem; }
-.kpi { padding: 0.75rem 0.9rem; border-radius: 0.75rem; border: 1px solid rgba(128, 128, 128, 0.25); }
+.small-muted { color: rgba(49, 51, 63, 0.65); font-size: 0.92rem; }
+.kpi { padding: 0.75rem 0.9rem; border-radius: 0.75rem; border: 1px solid rgba(49, 51, 63, 0.12); }
 .kpi b { font-size: 1.05rem; }
 hr { margin: 0.9rem 0; }
 </style>
@@ -169,76 +169,46 @@ doctors_default = doctors_from_cfg(cfg_default)
 # =====================================================================
 if mode == "Indisponibilità (Medico)":
     st.subheader("Indisponibilità (Medico)")
-    st.write(
-        "Compila le tue indisponibilità per uno o più mesi. "
-        "Le indisponibilità degli altri non sono visibili."
-    )
+    st.write("Compila le tue indisponibilità per uno o più mesi. Le indisponibilità degli altri non sono visibili.")
 
     pins = _get_doctor_pins()
     if not pins:
         st.error("PIN medici non configurati in secrets (doctor_pins).")
         st.stop()
 
-    # ---- Session state (evita che l'app 'torni alla home' ad ogni modifica) ----
-    if "doctor_auth_ok" not in st.session_state:
-        st.session_state.doctor_auth_ok = False
-        st.session_state.doctor_name = None
+    with st.form("medico_login"):
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            doctor = st.selectbox("1) Seleziona il tuo nome", doctors_default, index=0)
+        with col2:
+            pin = st.text_input("2) PIN", type="password", help="PIN personale a 4 cifre")
 
-    if st.session_state.doctor_auth_ok:
-        st.success(f"Accesso attivo: **{st.session_state.doctor_name}**")
-        if st.button("Esci / cambia medico"):
-            st.session_state.doctor_auth_ok = False
-            st.session_state.doctor_name = None
-            st.session_state.pop("doctor_selected_months", None)
-            # cancella anche eventuali editor keys (non obbligatorio)
-            st.rerun()
+        # month selection (next 6 months)
+        today = date.today()
+        default_year, default_month = today.year, today.month
+        upcoming = []
+        for i in range(0, 6):
+            mm = (default_month - 1 + i) % 12 + 1
+            yy = default_year + ((default_month - 1 + i) // 12)
+            upcoming.append((yy, mm))
+        label_map = {(yy, mm): f"{yy}-{mm:02d}" for yy, mm in upcoming}
 
-    if not st.session_state.doctor_auth_ok:
-        with st.form("medico_login", clear_on_submit=False):
-            col1, col2 = st.columns([2, 1])
-            with col1:
-                doctor = st.selectbox("1) Seleziona il tuo nome", doctors_default, index=0, key="login_doctor")
-            with col2:
-                pin = st.text_input("2) PIN", type="password", key="login_pin", help="PIN personale a 4 cifre")
-            go = st.form_submit_button("Accedi", type="primary")
+        selected = st.multiselect(
+            "3) Mesi da compilare",
+            options=upcoming,
+            default=[upcoming[0]],
+            format_func=lambda x: label_map[x],
+            help="Puoi inserire indisponibilità per più mesi in un’unica volta.",
+        )
 
-        if go:
-            expected = str(pins.get(doctor, ""))
-            if pin and pin == expected:
-                st.session_state.doctor_auth_ok = True
-                st.session_state.doctor_name = doctor
-                st.rerun()
-            else:
-                st.error("PIN non valido. Controlla il PIN e riprova.")
+        go = st.form_submit_button("Accedi", type="primary")
 
+    expected = str(pins.get(doctor, ""))
+    if not go:
         st.stop()
-
-    doctor = st.session_state.doctor_name
-
-    # ---- Mesi selezionabili: orizzonte lungo (10 anni) per evitare modifiche future ----
-    today = date.today()
-    horizon_months = 120  # 10 anni
-    months = []
-    for i in range(horizon_months):
-        mm = (today.month - 1 + i) % 12 + 1
-        yy = today.year + ((today.month - 1 + i) // 12)
-        months.append((yy, mm))
-    label_map = {(yy, mm): f"{yy}-{mm:02d}" for (yy, mm) in months}
-
-    default_sel = st.session_state.get("doctor_selected_months") or [months[0]]
-    selected = st.multiselect(
-        "Mesi da compilare",
-        options=months,
-        default=default_sel,
-        format_func=lambda x: label_map.get(x, f"{x[0]}-{x[1]:02d}"),
-        help="Puoi inserire indisponibilità per più mesi. L’elenco arriva fino a 10 anni avanti.",
-    )
-    if not selected:
-        st.info("Seleziona almeno un mese per iniziare.")
+    if not pin or pin != expected:
+        st.error("PIN non valido. Controlla il PIN e riprova.")
         st.stop()
-
-    # salva la selezione per i rerun successivi
-    st.session_state.doctor_selected_months = selected
 
     # Load store after auth (so we don't hit GitHub before login)
     try:
@@ -271,7 +241,12 @@ if mode == "Indisponibilità (Medico)":
                 init,
                 num_rows="dynamic",
                 use_container_width=True,
-                key=f"unav_editor_{doctor}_{yy}_{mm}",
+                column_config={
+                    "Data": st.column_config.DateColumn("Data"),
+                    "Fascia": st.column_config.SelectboxColumn("Fascia", options=list(ustore.VALID_SHIFTS)),
+                    "Note": st.column_config.TextColumn("Note"),
+                },
+                key=f"ed_{doctor}_{yy}_{mm}",
             )
             edited_by_month[(yy, mm)] = edited
 
@@ -279,10 +254,10 @@ if mode == "Indisponibilità (Medico)":
     with c1:
         save = st.button("Salva indisponibilità", type="primary")
     with c2:
-        st.caption("Privacy: salviamo solo le righe del tuo nominativo nei mesi selezionati.")
+        st.caption("Privacy: vedi e modifichi solo le tue indisponibilità. L’Admin usa un file aggregato non modificabile dai singoli.")
 
     if save:
-        new_rows = list(store_rows)
+        new_rows = store_rows
         for (yy, mm), edited in edited_by_month.items():
             entries = []
             for r in edited:
