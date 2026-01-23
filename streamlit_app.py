@@ -215,30 +215,49 @@ if mode == "Indisponibilità (Medico)":
 
     doctor = st.session_state.doctor_name
 
-    # ---- Mesi selezionabili: orizzonte lungo (10 anni) per evitare modifiche future ----
+    # ---- Selezione mesi da compilare (Anno + Mese separati) ----
     today = date.today()
-    horizon_months = 120  # 10 anni
-    months = []
-    for i in range(horizon_months):
-        mm = (today.month - 1 + i) % 12 + 1
-        yy = today.year + ((today.month - 1 + i) // 12)
-        months.append((yy, mm))
-    label_map = {(yy, mm): f"{yy}-{mm:02d}" for (yy, mm) in months}
+    horizon_years = 20  # ampia finestra per evitare modifiche future
+    year_options = list(range(today.year, today.year + horizon_years + 1))
+    month_names = {
+        1: "Gennaio", 2: "Febbraio", 3: "Marzo", 4: "Aprile", 5: "Maggio", 6: "Giugno",
+        7: "Luglio", 8: "Agosto", 9: "Settembre", 10: "Ottobre", 11: "Novembre", 12: "Dicembre",
+    }
 
-    default_sel = st.session_state.get("doctor_selected_months") or [months[0]]
-    selected = st.multiselect(
-        "Mesi da compilare",
-        options=months,
-        default=default_sel,
-        format_func=lambda x: label_map.get(x, f"{x[0]}-{x[1]:02d}"),
-        help="Puoi inserire indisponibilità per più mesi. L’elenco arriva fino a 10 anni avanti.",
-    )
+    sel_default = st.session_state.get("doctor_selected_months") or [(today.year, today.month)]
+    sel_set = set(sel_default)
+
+    st.subheader("3) Seleziona mese/i da compilare")
+    c1, c2, c3, c4 = st.columns([1, 1.4, 1, 1])
+    with c1:
+        yy_sel = st.selectbox("Anno", year_options, index=0, key="doctor_year_sel")
+    with c2:
+        mm_sel = st.selectbox(
+            "Mese",
+            list(range(1, 13)),
+            format_func=lambda m: f"{m:02d} - {month_names.get(m, str(m))}",
+            key="doctor_month_sel",
+        )
+    with c3:
+        add_month = st.button("Aggiungi", use_container_width=True, help="Aggiunge l’anno/mese selezionato all’elenco.")
+    with c4:
+        remove_month = st.button("Rimuovi", use_container_width=True, help="Rimuove l’anno/mese selezionato dall’elenco.")
+
+    cur = (int(yy_sel), int(mm_sel))
+    if add_month:
+        sel_set.add(cur)
+    if remove_month:
+        sel_set.discard(cur)
+
+    selected = sorted(sel_set)
+    st.session_state.doctor_selected_months = selected
+
+    st.caption("Mesi selezionati: " + ", ".join([f"{yy}-{mm:02d}" for (yy, mm) in selected]))
     if not selected:
-        st.info("Seleziona almeno un mese per iniziare.")
+        st.info("Aggiungi almeno un mese per iniziare.")
         st.stop()
 
-    # salva la selezione per i rerun successivi
-    st.session_state.doctor_selected_months = selected
+    label_map = {(yy, mm): f"{yy}-{mm:02d}" for (yy, mm) in selected}
 
     # Load store after auth (so we don't hit GitHub before login)
     try:
@@ -271,6 +290,11 @@ if mode == "Indisponibilità (Medico)":
                 init,
                 num_rows="dynamic",
                 use_container_width=True,
+                column_config={
+                    "Data": st.column_config.DateColumn("Data", required=True),
+                    "Fascia": st.column_config.SelectboxColumn("Fascia", options=["Mattina", "Pomeriggio", "Notte", "Diurno", "Tutto il giorno"], required=True),
+                    "Note": st.column_config.TextColumn("Note"),
+                },
                 key=f"unav_editor_{doctor}_{yy}_{mm}",
             )
             edited_by_month[(yy, mm)] = edited
