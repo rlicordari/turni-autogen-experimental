@@ -278,7 +278,7 @@ rules:
     balance: true
 
   S:
-    day: Wed
+    day: Tue
     pool:
       - Zito
       - Cusmà
