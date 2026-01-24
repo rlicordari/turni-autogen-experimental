@@ -19,6 +19,53 @@ import turni_generator as tg
 
 APP_BUILD = "2026-01-23-ui-v2"
 
+
+# ---- Indisponibilità: fasce ammesse e normalizzazione (per compatibilità con valori "storici") ----
+FASCIA_OPTIONS = ["Mattina", "Pomeriggio", "Notte", "Diurno", "Tutto il giorno"]
+
+def normalize_fascia(val: object) -> tuple[str, bool, bool]:
+    """Return (canonical_value, changed, unknown).
+
+    - changed: value was recognized but normalized (e.g., 'matt' -> 'Mattina')
+    - unknown: value wasn't recognized; we default to 'Tutto il giorno' but we warn the user.
+    """
+    if val is None:
+        return "", False, False
+    s = str(val).strip()
+    if not s:
+        return "", False, False
+    key = s.casefold().strip()
+    key = " ".join(key.split())  # collapse whitespace
+
+    # direct matches (case-insensitive)
+    direct = {
+        "mattina": "Mattina",
+        "pomeriggio": "Pomeriggio",
+        "notte": "Notte",
+        "diurno": "Diurno",
+        "tutto il giorno": "Tutto il giorno",
+        "tutto giorno": "Tutto il giorno",
+        "all day": "Tutto il giorno",
+        "giornata intera": "Tutto il giorno",
+    }
+    if key in direct:
+        canon = direct[key]
+        return canon, canon != s, False
+
+    # fuzzy matches
+    if "tutto" in key or "all" in key or "intera" in key:
+        return "Tutto il giorno", True, False
+    if "diurn" in key or "daytime" in key or key == "d":
+        return "Diurno", True, False
+    if "matt" in key or "morning" in key or key in {"am", "a.m."}:
+        return "Mattina", True, False
+    if "pome" in key or "pom" in key or "afternoon" in key or key in {"pm", "p.m."}:
+        return "Pomeriggio", True, False
+    if "nott" in key or "night" in key or key == "n":
+        return "Notte", True, False
+
+    # unknown
+    return "Tutto il giorno", True, True
 # ---------------- Page config & style ----------------
 st.set_page_config(
     page_title="Turni UTIC – Autogeneratore",
@@ -276,12 +323,27 @@ if mode == "Indisponibilità (Medico)":
             st.caption("Inserisci righe con Data + Fascia. Le righe vuote verranno ignorate.")
             existing = ustore.filter_doctor_month(store_rows, doctor, yy, mm)
             init = []
+            conversions = []
             for r in existing:
                 try:
                     d = datetime.fromisoformat(r["date"]).date()
                 except Exception:
                     d = r["date"]
-                init.append({"Data": d, "Fascia": r["shift"], "Note": r.get("note", "")})
+                raw_shift = r.get("shift", "")
+                canon_shift, changed, unknown = normalize_fascia(raw_shift)
+                if changed:
+                    conversions.append({
+                        "Data": d,
+                        "Fascia_originale": raw_shift,
+                        "Fascia_impostata": canon_shift,
+                        "Nota": "Non riconosciuta (default applicato)" if unknown else "Normalizzata",
+                    })
+                init.append({"Data": d, "Fascia": canon_shift or "Tutto il giorno", "Note": r.get("note", "")})
+
+            if conversions:
+                st.warning("Abbiamo trovato alcune fasce non standard salvate in passato. Le abbiamo normalizzate automaticamente: controlla e, se necessario, modifica dal menu a tendina prima di salvare.")
+                st.dataframe(conversions, use_container_width=True, hide_index=True)
+
 
             if not init:
                 init = [{"Data": date(yy, mm, 1), "Fascia": "Mattina", "Note": ""}]
@@ -292,7 +354,7 @@ if mode == "Indisponibilità (Medico)":
                 use_container_width=True,
                 column_config={
                     "Data": st.column_config.DateColumn("Data", required=True),
-                    "Fascia": st.column_config.SelectboxColumn("Fascia", options=["Mattina", "Pomeriggio", "Notte", "Diurno", "Tutto il giorno"], required=True),
+                    "Fascia": st.column_config.SelectboxColumn("Fascia", options=FASCIA_OPTIONS, required=True),
                     "Note": st.column_config.TextColumn("Note"),
                 },
                 key=f"unav_editor_{doctor}_{yy}_{mm}",
@@ -315,7 +377,8 @@ if mode == "Indisponibilità (Medico)":
                     d = d.date()
                 if not isinstance(d, date):
                     continue
-                sh = str(r.get("Fascia", "")).strip()
+                sh_raw = r.get("Fascia", "")
+                sh, _changed, _unknown = normalize_fascia(sh_raw).strip()
                 note = str(r.get("Note", "") or "")
                 if not sh:
                     continue
@@ -342,17 +405,33 @@ else:
         st.error("Admin PIN non configurato in secrets (auth.admin_pin).")
         st.stop()
 
-    with st.form("admin_login"):
-        pin = st.text_input("PIN Admin", type="password")
-        ok = st.form_submit_button("Sblocca area Admin", type="primary")
+    # Persist admin auth across reruns
+    if "admin_auth_ok" not in st.session_state:
+        st.session_state.admin_auth_ok = False
 
-    if not ok:
-        st.stop()
-    if pin != admin_pin:
-        st.error("PIN Admin errato.")
-        st.stop()
+    if not st.session_state.admin_auth_ok:
+        with st.form("admin_login"):
+            pin = st.text_input("PIN Admin", type="password")
+            ok = st.form_submit_button("Sblocca area Admin", type="primary")
 
-    st.success("Area Admin sbloccata ✅")
+        if not ok:
+            st.stop()
+        if pin != admin_pin:
+            st.error("PIN Admin errato.")
+            st.stop()
+
+        st.session_state.admin_auth_ok = True
+        # Rerun to avoid re-submitting the form on next widget interaction
+        st.rerun()
+
+    col_logout, col_status = st.columns([1, 3])
+    with col_logout:
+        if st.button("Esci (Admin)", help="Chiude la sessione Admin su questo browser."):
+            st.session_state.admin_auth_ok = False
+            st.rerun()
+    with col_status:
+        st.success("Area Admin sbloccata ✅")
+
     st.divider()
 
     # Step 1: Periodo
