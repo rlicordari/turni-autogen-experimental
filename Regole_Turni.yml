@@ -232,6 +232,7 @@ rules:
       - Pugliatti
       - Trio
       - Manganaro
+      - De Gregorio
     no_consecutive_days_same_doctor: true
 
   # ==========================================================
