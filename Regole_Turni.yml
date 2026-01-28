@@ -238,7 +238,7 @@ rules:
   # L (PADIGLIONI) – Mon/Tue/Wed, Recupero <= 3
   # ==========================================================
   L:
-    days: [Mon, Tue, Wed]
+    days: [Mon, Wed, Thu]
     quota_recupero_per_month: 3
     pool_other:
       - Allegra
