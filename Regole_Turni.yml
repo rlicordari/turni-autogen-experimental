@@ -181,6 +181,7 @@ rules:
       - Crea
       - Pugliatti
       - Manganaro
+    balance: true
 
   # ==========================================================
   # H (UTIC pomeriggio)
@@ -234,6 +235,7 @@ rules:
       - Manganaro
       - De Gregorio
     no_consecutive_days_same_doctor: true
+    balance: true
 
   # ==========================================================
   # L (PADIGLIONI) – Mon/Tue/Wed, Recupero <= 3
@@ -250,6 +252,7 @@ rules:
       - Pugliatti
       - Trio
     avoid_close_repeats: true
+    balance: true
 
   # ==========================================================
   # Q/R/S/T (ECO + Interni)
@@ -285,6 +288,7 @@ rules:
     pool:
       - Zito
       - Cusmà
+    balance: true
 
   T:
     days: Mon-Sat
