@@ -22,6 +22,8 @@ columns:
   V: Sala PM
   W: Ergometria/CPET
   Y: Ambulatori specialistici
+  Z: Vascolare
+  AA: SPOC
   AB: Holter/Brugada/FA
   AC: Scintigrafia
   AD: Medici liberi 1
@@ -58,12 +60,9 @@ global_constraints:
   avoid_weekend_night_concentration: true
 
   # K=T il sabato (slot unico)
-  saturday_K_equals_T: true
+  saturday_K_equals_T: false
 
   # Penalità/valvole di sfogo (usate solo se serve per evitare infeasible)
-  recupero_penalty_default: 50
-  recupero_penalty_echo: 250
-  recupero_penalty_QRT: 200
   weekend_off_soft: true
   weekend_off_penalty: 80
   relief_valves:
@@ -175,6 +174,8 @@ rules:
     must_be_free_of_other_tasks: true
     not_same_as_E: true
     distribution_pool:
+    balance: true
+    balance_weight: 120
       - Allegra
       - Cimino
       - Dattilo
@@ -196,6 +197,16 @@ rules:
       - Trio
       - Cusmà
     cap_mon_fri_per_doctor: 5
+    distribution_pool:
+      - Licordari
+      - Colarusso
+      - Migliorato
+      - Trio
+      - Cusmà
+      - Grimaldi
+      - Calabrò
+    balance: true
+    balance_weight: 140
     saturday_must_be_covered: true
 
   # ==========================================================
@@ -206,6 +217,9 @@ rules:
     monthly_quotas:
       Zito: 2
       Calabrò: 2
+    # Esclusioni: Calabrò NON può fare NOTTE il Sab/Dom
+    weekend_excluded_doctors:
+      - Calabrò
     pool_other:
       - Allegra
       - Cimino
@@ -232,13 +246,15 @@ rules:
       - Pugliatti
       - Trio
       - Manganaro
+      - De Gregorio
     no_consecutive_days_same_doctor: true
+    balance: true
 
   # ==========================================================
-  # L (PADIGLIONI) – Mon/Tue/Wed, Recupero <= 3
+  # L (PADIGLIONI) – Mon/Wed/Thu, Recupero <= 3
   # ==========================================================
   L:
-    days: [Mon, Tue, Wed]
+    days: [Mon, Wed, Thu]
     quota_recupero_per_month: 3
     pool_other:
       - Allegra
@@ -284,6 +300,7 @@ rules:
     pool:
       - Zito
       - Cusmà
+    balance: true
 
   T:
     days: Mon-Sat
@@ -307,7 +324,12 @@ rules:
     pool: [Crea, "D'Angelo", Allegra, Dattilo, Cimino]
 
   V:
-    days: [Wed, Fri]
+    days:
+      - Mon
+      - Wed
+      - Fri
+    balance: true
+    balance_weight: 120
     pool: [Dattilo, Crea, Allegra]
 
   W:
@@ -320,12 +342,44 @@ rules:
     recupero_two_mondays_per_month: true
     other_pool: [Licordari, Colarusso, "D'Angelo"]
 
+
+  # ==========================================================
+  # Z (VASCOLARE) – solo Mer/Ven
+  # ==========================================================
+  Z:
+    days:
+      - Wed
+      - Fri
+    pool:
+      - De Gregorio
+      - Manganaro
+      - Cusmà
+      - D'Angelo
+      - Licordari
+    balance: true
+    balance_weight: 120
+
+  # ==========================================================
+  # AA (SPOC) – solo Lun/Mer (copiato da K o T in output; bilanciamento post-process)
+  # ==========================================================
+  AA:
+    days:
+      - Mon
+      - Wed
+    copy_from:
+      - K
+      - T
   AB:
     weekly: true
     fixed_day: Thu
     prefer: Crea
     fallback_pool: [Dattilo, Cimino, Allegra, "D'Angelo"]
 
+    # Due sabati al mese (slot aggiuntivo) SOLO con CREA
+    saturday_per_month: 2
+    saturday_only_doctor: Crea
+    saturday_soft: true
+    saturday_shortfall_penalty: 2000
   AC:
     days: [Tue, Wed]
     fixed: Migliorato

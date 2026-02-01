@@ -926,6 +926,10 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                     if special in doctors_set and special not in allowed:
                         allowed.append(special)
                 allowed = [d for d in allowed if d != "Recupero"]
+                # Weekend exclusions (e.g., Calabrò not allowed on Sat/Sun nights)
+                wex = [norm_name(x) for x in (rJ.get('weekend_excluded_doctors') or [])]
+                if day.dow in ['Sat','Sun'] and wex:
+                    allowed = [d for d in allowed if norm_name(d) not in set(wex)]
                 allowed = apply_unavailability(allowed, day, "Notte", unav)
                 slots.append(Slot(day, f"{day.date}-J", ["J"], allowed, required=True, shift="Notte", rule_tag="J"))
         # ---- K Letto (daily, but blank on Sundays/festivi)
@@ -993,13 +997,28 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                 pool = mk_allowed(r.get("pool") or [])
                 pool = apply_unavailability(pool, day, "Mattina", unav)
                 slots.append(Slot(day, f"{day.date}-U", ["U"], pool, required=True, shift="Mattina", rule_tag="U"))
-        # ---- V Sala PM (Wed,Fri)
+        # ---- V Sala PM (Mon,Wed,Fri) – il Venerdì: 2 medici (CREA + (DATTILO|ALLEGRA))
         if "V" in rules:
             r = rules["V"]
             if dayspec_contains(day.dow, r.get("days")):
+                pool_base = mk_allowed(r.get("pool") or [])
+                pool_base = apply_unavailability(pool_base, day, "Mattina", unav)
+                if day.dow == "Fri":
+                    crea = norm_name(r.get("friday_required_doctor") or "Crea")
+                    pool_crea = [crea] if crea in pool_base else []
+                    other_allowed = {norm_name("Dattilo"), norm_name("Allegra")}
+                    pool_other = [d for d in pool_base if norm_name(d) in other_allowed and norm_name(d) != crea]
+                    slots.append(Slot(day, f"{day.date}-V1", ["V"], pool_crea, required=True, shift="Mattina", rule_tag="V"))
+                    slots.append(Slot(day, f"{day.date}-V2", ["V"], pool_other, required=True, shift="Mattina", rule_tag="V"))
+                else:
+                    slots.append(Slot(day, f"{day.date}-V", ["V"], pool_base, required=True, shift="Mattina", rule_tag="V"))
+        # ---- Z Vascolare (Wed,Fri)
+        if "Z" in rules:
+            r = rules["Z"]
+            if dayspec_contains(day.dow, r.get("days")):
                 pool = mk_allowed(r.get("pool") or [])
                 pool = apply_unavailability(pool, day, "Mattina", unav)
-                slots.append(Slot(day, f"{day.date}-V", ["V"], pool, required=True, shift="Mattina", rule_tag="V"))
+                slots.append(Slot(day, f"{day.date}-Z", ["Z"], pool, required=True, shift="Mattina", rule_tag="Z"))
         # ---- W Ergometria/CPET (Mon-Fri; Tue fixed)
         if "W" in rules:
             r = rules["W"]
@@ -1040,6 +1059,13 @@ def slots_for_month(cfg: dict, days: List[DayRow], unav: Dict[str, Dict[dt.date,
                 seen=set(); pool=[x for x in pool if not (x in seen or seen.add(x))]
                 pool = apply_unavailability(pool, day, "Mattina", unav)
                 slots.append(Slot(day, f"{day.date}-AB", ["AB"], pool, required=True, shift="Mattina", rule_tag="AB"))
+            # Slot aggiuntivo al Sabato (2 al mese) SOLO con CREA (quota gestita nel solver)
+            sat_n = int(r.get("saturday_per_month", 0) or 0)
+            if sat_n > 0 and day.dow == "Sat":
+                doc_sat = norm_name(r.get("saturday_only_doctor") or "Crea")
+                pool_sat = [doc_sat] if doc_sat in doctors_set else []
+                pool_sat = apply_unavailability(pool_sat, day, "Mattina", unav)
+                slots.append(Slot(day, f"{day.date}-AB_SAT", ["AB"], pool_sat, required=False, shift="Mattina", rule_tag="AB_SAT"))
         # ---- AC Scintigrafia (Tue/Wed fixed)
         if "AC" in rules:
             r = rules["AC"]
@@ -1251,6 +1277,36 @@ def solve_with_ortools(cfg: dict, days: List[DayRow], slots: List[Slot]) -> Tupl
                     model.Add(sum(vars_) <= 1 + y_by_doc[d])
                 else:
                     model.Add(sum(vars_) <= 1)
+    # ---- H/I: divieto di stesso medico in giorni consecutivi (H e I indipendenti)
+    # Vale anche sui Festivi, dove esiste lo slot unico HI (colonne H+I).
+    try:
+        slot_ids_by_date_col: Dict[Tuple[dt.date, str], List[str]] = defaultdict(list)
+        for s in slots:
+            for c in (s.columns or []):
+                cc = str(c).strip().upper()
+                if cc in {"H", "I"}:
+                    slot_ids_by_date_col[(s.day.date, cc)].append(s.slot_id)
+        days_sorted = sorted(days, key=lambda d: d.date)
+        for i in range(len(days_sorted) - 1):
+            d1 = days_sorted[i].date
+            d2 = days_sorted[i + 1].date
+            for col in ("H", "I"):
+                sids1 = slot_ids_by_date_col.get((d1, col), [])
+                sids2 = slot_ids_by_date_col.get((d2, col), [])
+                if not sids1 and not sids2:
+                    continue
+                for doc in doctors:
+                    if doc == "Recupero":
+                        continue
+                    v1 = [x.get((sid, doc)) for sid in sids1 if (sid, doc) in x]
+                    v2 = [x.get((sid, doc)) for sid in sids2 if (sid, doc) in x]
+                    v1 = [v for v in v1 if v is not None]
+                    v2 = [v for v in v2 if v is not None]
+                    if v1 or v2:
+                        model.Add(sum(v1) + sum(v2) <= 1)
+    except Exception:
+        pass
+
     # ---- D/F pattern 3+3 for Grimaldi/Calabrò (conditional hard)
     # If configured in rules.D_F (pattern_3_3 + pattern_conditional_hard),
     # enforce:
@@ -1661,6 +1717,25 @@ def solve_with_ortools(cfg: dict, days: List[DayRow], slots: List[Slot]) -> Tupl
                     vars_.append(x[(s.slot_id, "Recupero")])
             if vars_:
                 model.Add(sum(vars_) == 2)
+    # AB: 2 sabati/mese SOLO con CREA (slot AB_SAT, soft di default per evitare infeasible)
+    if "rules" in cfg and "AB" in cfg["rules"]:
+        rAB = cfg["rules"]["AB"]
+        sat_n = int(rAB.get("saturday_per_month", 0) or 0)
+        sat_doc = norm_name(rAB.get("saturday_only_doctor") or "Crea")
+        if sat_n > 0 and sat_doc in doctors:
+            vars_=[]
+            for s in slots:
+                if s.rule_tag == "AB_SAT" and (s.slot_id, sat_doc) in x:
+                    vars_.append(x[(s.slot_id, sat_doc)])
+            if vars_:
+                if bool(rAB.get("saturday_soft", True)):
+                    model.Add(sum(vars_) <= sat_n)
+                    short = model.NewIntVar(0, sat_n, "AB_sat_short")
+                    model.Add(sum(vars_) + short == sat_n)
+                    extra_obj.append(int(rAB.get("saturday_shortfall_penalty", 2000)) * short)
+                else:
+                    model.Add(sum(vars_) == sat_n)
+
     # Weekend full off: at least N Sat+Sun "full weekends off" per doctor.
     # By default this is a HARD constraint. If it makes the month infeasible,
     # you can set global_constraints.weekend_off_soft: true to make it a SOFT constraint
@@ -1743,17 +1818,64 @@ def solve_with_ortools(cfg: dict, days: List[DayRow], slots: List[Slot]) -> Tupl
             model.Add(load == sum(vars_))
             model.Add(load <= max_load)
     objective_terms.append(max_load * 10)
-    # Penalize using placeholder 'Recupero' (otherwise the solver overuses it to improve fairness)
-    gc_obj = cfg.get("global_constraints", {}) or {}
-    rec_pen_default = int(gc_obj.get("recupero_penalty_default", 50))
-    rec_pen_echo = int(gc_obj.get("recupero_penalty_echo", 200))
-    for s in slots:
-        v_rec = x.get((s.slot_id, "Recupero"))
-        if v_rec is None:
-            continue
-        cols = set(s.columns)
-        pen = rec_pen_echo if cols.intersection({"Q","R","T"}) else rec_pen_default
-        objective_terms.append(pen * v_rec)
+    # Column-specific balancing (and optional soft caps) for specific columns.
+    # If a rule has `balance: true`, or defines a `distribution_pool`, we try to balance assignments within that column.
+    # If a rule defines `max_per_doctor: N`, we penalize assignments above N (soft cap).
+    # NOTE: a hard cap is not enforced here because it can easily make the model infeasible when the pool is small;
+    # the soft cap is still reported via resulting counts (and can be made hard by widening the pool).
+    try:
+        for col_key, rcol in (rules_map or {}).items():
+            if not isinstance(rcol, dict):
+                continue
+            if not (rcol.get('balance') or rcol.get('distribution_pool') or rcol.get('max_per_doctor')):
+                continue
+            # consider only slots whose rule_tag matches this column key (avoid Festivo_HI etc.)
+            slot_ids = [s.slot_id for s in slots if (getattr(s, 'rule_tag', '') == col_key)]
+            if not slot_ids:
+                continue
+            # prefer explicit pools; otherwise infer from variables
+            pool_raw = (rcol.get('pool') or rcol.get('distribution_pool') or rcol.get('allowed') or [])
+            pool = []
+            if isinstance(pool_raw, list):
+                for p in pool_raw:
+                    pn = norm_name(p)
+                    if pn and pn in doc_to_idx and pn != 'Recupero':
+                        pool.append(pn)
+            if not pool:
+                # fallback: any doctor that actually appears in some var for these slots
+                pool = []
+                for d in real_doctors:
+                    for sid in slot_ids:
+                        if x.get((sid, d)) is not None:
+                            pool.append(d)
+                            break
+            if not pool:
+                continue
+            bal_w = int(rcol.get('balance_weight') or 40)
+            cap = int(rcol.get('max_per_doctor') or 0)
+            cap_pen = int(rcol.get('max_per_doctor_penalty') or 800)
+            max_col = model.NewIntVar(0, len(slot_ids), f"max_{col_key}_load")
+            for d in pool:
+                vars_d = []
+                for sid in slot_ids:
+                    v = x.get((sid, d))
+                    if v is not None:
+                        vars_d.append(v)
+                if not vars_d:
+                    continue
+                load_d = model.NewIntVar(0, len(slot_ids), f"load_{col_key}_{hash(d)%10**6}")
+                model.Add(load_d == sum(vars_d))
+                model.Add(load_d <= max_col)
+                if cap > 0:
+                    over = model.NewIntVar(0, len(slot_ids), f"over_{col_key}_{hash(d)%10**6}")
+                    # over >= load_d - cap, over >= 0
+                    model.Add(load_d - cap <= over)
+                    model.Add(over >= 0)
+                    objective_terms.append(over * cap_pen)
+            objective_terms.append(max_col * bal_w)
+    except Exception:
+        # never fail scheduling due to a balance/cap config issue
+        pass
     # Maximize number of Wednesdays with dedicated S assignment (if optional)
     s_slots = [s for s in slots if s.columns == ["S"]]
     s_dedicated = []
@@ -2002,6 +2124,7 @@ def write_output(
     slots: List[Slot],
     assignment: Dict[str, Optional[str]],
     out_path: Path,
+    cfg: Optional[dict] = None,
     unav_map: Optional[Dict[str, Dict[dt.date, Set[str]]]] = None,
 ):
     # Clear target columns (only those managed)
@@ -2009,6 +2132,8 @@ def write_output(
     for s in slots:
         managed_cols |= set(s.columns)
     # do not wipe A,B headers; wipe from row 2
+    if cfg and isinstance(cfg.get("rules", {}), dict) and "AA" in (cfg.get("rules") or {}):
+        managed_cols.add("AA")
     for drow in days:
         for col in managed_cols:
             ws[f"{col}{drow.row_idx}"].value = None
@@ -2029,6 +2154,18 @@ def write_output(
         seen = set()
         uniq = [d for d in docs if not (d in seen or seen.add(d))]
         ws[f"{col}{row_idx}"].value = "\n".join(uniq)
+
+    # Ensure headers exist for new/optional columns (Z, AA) even on older templates.
+    for _col, _label in [
+        ("Z", ((cfg or {}).get("columns") or {}).get("Z", "Vascolare")),
+        ("AA", ((cfg or {}).get("columns") or {}).get("AA", "SPOC")),
+    ]:
+        try:
+            h = ws[f"{_col}1"]
+            if h.value is None or str(h.value).strip() == "":
+                h.value = _label
+        except Exception:
+            pass
 
     # Backward-compat: older templates may only have AD/AE (or no headers at all).
     # Ensure headers exist for the "medici liberi" block.
@@ -2053,14 +2190,60 @@ def write_output(
     # Remove placeholder if present
     all_docs = {d for d in all_docs if d != "Recupero"}
     unav_map = unav_map or {}
+    # Escludi d'ufficio lo SMONTANTE NOTTE: chi ha fatto la NOTTE (colonna J) il giorno prima
+    # non può essere considerato "libero" il giorno successivo (anche se non assegnato a nessuna colonna).
+    night_by_date: Dict[dt.date, str] = {}
+    for s in slots:
+        if s.columns == ["J"]:
+            nd = assignment.get(s.slot_id)
+            if nd:
+                night_by_date[s.day.date] = nd
+
     for drow in days:
         assigned_today = assigned_by_day.get(drow.date, set())
         unavailable_today = {d for d in all_docs if unav_map.get(d, {}).get(drow.date)}
-        free = sorted(list(all_docs - assigned_today - unavailable_today), key=lambda s: s.lower())
+        smontante = night_by_date.get(drow.date - dt.timedelta(days=1))
+        smontanti = {smontante} if smontante else set()
+        free = sorted(list(all_docs - assigned_today - unavailable_today - smontanti), key=lambda s: s.lower())
         ws[f"AD{drow.row_idx}"].value = free[0] if len(free) > 0 else None
         ws[f"AE{drow.row_idx}"].value = free[1] if len(free) > 1 else None
         ws[f"AF{drow.row_idx}"].value = free[2] if len(free) > 2 else None
         ws[f"AG{drow.row_idx}"].value = free[3] if len(free) > 3 else None
+
+    # Fill AA (SPOC): solo Lun/Mer, copiando il medico di K o T. Il bilanciamento è fatto
+    # in post-process scegliendo (quando K != T) il candidato meno usato nel mese.
+    if cfg and "rules" in cfg and "AA" in (cfg.get("rules") or {}):
+        rAA = (cfg.get("rules") or {}).get("AA") or {}
+        copy_from = [str(c).strip().upper() for c in (rAA.get("copy_from") or ["K", "T"])]
+        counts_by_month: Dict[Tuple[int, int], Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        for drow in days:
+            if not dayspec_contains(drow.dow, rAA.get("days")):
+                continue
+            candidates: List[str] = []
+            for src in copy_from:
+                try:
+                    v = ws[f"{src}{drow.row_idx}"].value
+                except Exception:
+                    v = None
+                if v is None:
+                    continue
+                name = str(v).splitlines()[0].strip()
+                if name:
+                    candidates.append(norm_name(name))
+            # uniq preserve order
+            seen=set()
+            candidates=[c for c in candidates if c and not (c in seen or seen.add(c))]
+            candidates=[c for c in candidates if c != "Recupero"]
+            if not candidates:
+                continue
+            if len(candidates) == 1:
+                chosen = candidates[0]
+            else:
+                mkey = (drow.date.year, drow.date.month)
+                chosen = min(candidates, key=lambda c: (counts_by_month[mkey].get(c, 0), c.lower()))
+            ws[f"AA{drow.row_idx}"].value = chosen
+            mkey = (drow.date.year, drow.date.month)
+            counts_by_month[mkey][chosen] += 1
 
     # Highlight "relief" blanks in yellow:
     # - slots that ended up with an empty allowed domain after applying unavailability
@@ -2332,7 +2515,7 @@ def generate_schedule(
     assignment, cdiag = assign_reperibilita_C(cfg, days, slots, assignment)
     if isinstance(cdiag, dict):
         stats.update(cdiag)
-    write_output(wb, ws, days, slots, assignment, outp, unav_map=unav_map)
+    write_output(wb, ws, days, slots, assignment, cfg=cfg, out_path=outp, unav_map=unav_map)
     logp = write_solver_log(outp, stats)
     return stats, str(logp) if logp else None
 
@@ -2374,7 +2557,7 @@ def run_gui():
                     "Solver",
                     "OR-Tools non disponibile o schedule infeasible per: " + ", ".join(greedy_months) + "\nUso greedy per quei mesi."
                 )
-            write_output(wb, ws, days, slots, assignment, outp, unav_map=unav_map)
+            write_output(wb, ws, days, slots, assignment, cfg=cfg, out_path=outp, unav_map=unav_map)
             logp = write_solver_log(outp, stats)
             msg = f"Creato: {outp}\nSolver: {stats.get('status')}"
             if logp:
@@ -2423,7 +2606,7 @@ def main():
     greedy_months = [k for k,v in (stats.get('months') or {}).items() if isinstance(v, dict) and v.get('solver_error')]
     if greedy_months:
         print("[WARN] OR-Tools non disponibile o infeasible per:", ", ".join(greedy_months), file=sys.stderr)
-    write_output(wb, ws, days, slots, assignment, outp, unav_map=unav_map)
+    write_output(wb, ws, days, slots, assignment, cfg=cfg, out_path=outp, unav_map=unav_map)
     logp = write_solver_log(outp, stats)
     if logp:
         print(f"OK: creato {outp} | solver={stats.get('status')} | log={logp}")

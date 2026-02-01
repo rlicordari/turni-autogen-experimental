@@ -5,6 +5,7 @@ import traceback
 import csv
 import json
 import requests
+import random
 from datetime import date, datetime
 from pathlib import Path
 from collections.abc import Mapping
@@ -199,6 +200,88 @@ def save_store_to_github(rows: list[dict], sha: str | None, message: str):
         text=text,
     )
 
+
+def _is_sha_conflict_error(err: Exception) -> bool:
+    """Return True if the HTTP error likely indicates a concurrent update (SHA mismatch / conflict)."""
+    if isinstance(err, requests.HTTPError):
+        resp = getattr(err, "response", None)
+        if resp is None:
+            return False
+        code = getattr(resp, "status_code", None)
+        if code in (409, 412):
+            return True
+        if code == 422:
+            # GitHub Contents API sometimes returns 422 for a SHA mismatch
+            try:
+                j = resp.json() if hasattr(resp, "json") else {}
+                msg = str(j.get("message", "") or "").lower()
+            except Exception:
+                msg = str(getattr(resp, "text", "") or "").lower()
+            if "sha" in msg and ("match" in msg or "invalid" in msg or "does not" in msg):
+                return True
+        return False
+    return False
+
+
+def save_doctor_unavailability_with_retry(
+    *,
+    doctor: str,
+    normalized_entries_by_month: dict[tuple[int, int], list[tuple[date, str, str]]],
+    updated_at: str,
+    message: str,
+    initial_rows: list[dict] | None = None,
+    initial_sha: str | None = None,
+    max_retries: int = 6,
+) -> tuple[list[tuple[str, dict]], str | None]:
+    """Concurrency-safe save for the shared GitHub CSV.
+
+    Strategy:
+      - Apply the doctor's month replacements on top of the latest store version.
+      - If a concurrent save happens (SHA conflict), reload and retry with backoff.
+    Returns: (audit_todo, final_sha)
+    """
+    last_err: Exception | None = None
+
+    # Deterministic order
+    months = sorted(normalized_entries_by_month.items(), key=lambda kv: (kv[0][0], kv[0][1]))
+
+    for attempt in range(max_retries):
+        # Use the previously loaded store for the first attempt to save one roundtrip.
+        if attempt == 0 and initial_rows is not None:
+            store_rows = list(initial_rows)
+            store_sha = initial_sha
+        else:
+            store_rows, store_sha = load_store_from_github()
+
+        new_rows = list(store_rows)
+        audit_todo: list[tuple[str, dict]] = []
+
+        for (yy, mm), entries_norm in months:
+            yy_i, mm_i = int(yy), int(mm)
+            existing_rows = ustore.filter_doctor_month(store_rows, doctor, yy_i, mm_i)
+            diff = compute_unavailability_diff(existing_rows, entries_norm)
+            if diff.get("added_count") or diff.get("removed_count") or diff.get("note_changed_count"):
+                audit_todo.append((f"{yy_i}-{mm_i:02d}", diff))
+
+            new_rows = ustore.replace_doctor_month(
+                new_rows, doctor, yy_i, mm_i, entries_norm, updated_at=updated_at
+            )
+
+        try:
+            save_store_to_github(new_rows, store_sha, message=message)
+            return audit_todo, store_sha
+        except Exception as e:
+            last_err = e
+            if _is_sha_conflict_error(e):
+                # Exponential backoff + jitter to reduce repeated collisions.
+                sleep_s = min(3.0, 0.35 * (2 ** attempt) + random.random() * 0.25)
+                time.sleep(sleep_s)
+                continue
+            raise
+
+    if last_err:
+        raise last_err
+    raise RuntimeError("Errore salvataggio: tentativi esauriti senza dettaglio.")
 
 # ---------------- GitHub settings & audit log ----------------
 DEFAULT_SETTINGS = {
@@ -438,7 +521,7 @@ def append_unavailability_audit_log(mk: str, row: dict, max_retries: int = 3):
             last_err = e
             # retry on sha mismatch / conflict
             resp = getattr(e, "response", None)
-            if resp is not None and getattr(resp, "status_code", None) in (409, 412):
+            if _is_sha_conflict_error(e):
                 continue
             raise
         except Exception as e:
@@ -750,21 +833,17 @@ if mode == "Indisponibilità (Medico)":
             st.stop()
 
         updated_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
-        new_rows = list(store_rows)
-
-        audit_todo: list[tuple[str, dict]] = []
-        for (yy, mm), entries_norm in (normalized_entries_by_month or {}).items():
-            existing_rows = ustore.filter_doctor_month(store_rows, doctor, int(yy), int(mm))
-            diff = compute_unavailability_diff(existing_rows, entries_norm)
-            if diff.get("added_count") or diff.get("removed_count") or diff.get("note_changed_count"):
-                audit_todo.append((f"{int(yy)}-{int(mm):02d}", diff))
-
-            new_rows = ustore.replace_doctor_month(
-                new_rows, doctor, int(yy), int(mm), entries_norm, updated_at=updated_at
-            )
 
         try:
-            save_store_to_github(new_rows, store_sha, message=f"Update unavailability: {doctor} ({updated_at})")
+            audit_todo, _final_sha = save_doctor_unavailability_with_retry(
+                doctor=doctor,
+                normalized_entries_by_month=normalized_entries_by_month or {},
+                updated_at=updated_at,
+                message=f"Update unavailability: {doctor} ({updated_at})",
+                initial_rows=store_rows,
+                initial_sha=store_sha,
+                max_retries=6,
+            )
 
             # Monthly audit log (best-effort)
             for mk_audit, diff in audit_todo:
@@ -1129,10 +1208,20 @@ else:
                     unav_path = td / "unavailability.xlsx"
                     unav_path.write_bytes(unav_upload.getvalue())
                 elif use_archive:
-                    store_rows, _sha = load_store_from_github()
-                    rows_month = ustore.filter_month(store_rows, int(year), int(month))
+                    # Read the archive, and re-check SHA once to minimize the chance
+                    # of generating from a stale snapshot while others are saving.
+                    store_rows_1, sha1 = load_store_from_github()
+                    rows_month = ustore.filter_month(store_rows_1, int(year), int(month))
                     unav_path = td / "unavailability_from_store.xlsx"
                     xlsx_utils.build_unavailability_xlsx(rows_month, DEFAULT_UNAV_TEMPLATE, unav_path)
+
+                    store_rows_2, sha2 = load_store_from_github()
+                    if sha1 and sha2 and sha2 != sha1:
+                        # Archive changed during preparation: rebuild from latest.
+                        rows_month = ustore.filter_month(store_rows_2, int(year), int(month))
+                        xlsx_utils.build_unavailability_xlsx(rows_month, DEFAULT_UNAV_TEMPLATE, unav_path)
+                        st.caption("Archivio indisponibilità aggiornato durante la preparazione: ricaricata l’ultima versione.")
+
                     st.caption(f"Archivio indisponibilità: {len(rows_month)} righe per {mk}")
 
                 status.update(label="Generazione turni…", state="running")
