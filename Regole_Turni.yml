@@ -179,7 +179,7 @@ rules:
       - Dattilo
       - Crea
       - Pugliatti
-      - Manganaro
+      - De Gregorio
     balance: true
     balance_weight: 120
   # ==========================================================
@@ -195,6 +195,7 @@ rules:
       - Migliorato
       - Trio
       - Cusmà
+      - Manganaro
     cap_mon_fri_per_doctor: 5
     distribution_pool:
       - Licordari
