@@ -182,6 +182,7 @@ rules:
       - Crea
       - Pugliatti
       - Manganaro
+    balance: true
 
   # ==========================================================
   # H (UTIC pomeriggio)
@@ -265,6 +266,7 @@ rules:
       - Pugliatti
       - Trio
     avoid_close_repeats: true
+    balance: true
 
   # ==========================================================
   # Q/R/S/T (ECO + Interni)
