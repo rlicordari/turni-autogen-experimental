@@ -129,6 +129,7 @@ rules:
     - D'Angelo
     - Pugliatti
     - De Gregorio
+    - Manganaro
     block_split_penalty: 500
   I:
     must_be_free_of_other_tasks: true
@@ -139,7 +140,6 @@ rules:
     - Dattilo
     - Crea
     - Pugliatti
-    - Manganaro
     - De Gregorio
     balance: true
     balance_weight: 120
@@ -154,6 +154,7 @@ rules:
     - Migliorato
     - Trio
     - Cusmà
+    - Manganaro
     cap_mon_fri_per_doctor: 5
     distribution_pool:
     - Licordari
@@ -161,6 +162,7 @@ rules:
     - Migliorato
     - Trio
     - Cusmà
+    - Manganaro
     - Grimaldi
     - Calabrò
     balance: true
