@@ -169,7 +169,7 @@ rules:
     balance_weight: 140
     saturday_must_be_covered: true
   J:
-    thursday_blank: false
+    thursday_blank: true
     monthly_quotas:
       Zito: 2
       Calabrò: 2
