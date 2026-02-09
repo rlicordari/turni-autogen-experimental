@@ -223,6 +223,47 @@ def _is_sha_conflict_error(err: Exception) -> bool:
     return False
 
 
+def _month_entries_signature(rows: list[dict]) -> list[tuple[str, str, str]]:
+    """Return a deterministic signature for month rows: (date, shift, note)."""
+    sig: set[tuple[str, str, str]] = set()
+    for r in rows:
+        try:
+            d_iso = ustore.parse_iso_date(r.get("date", "")).isoformat()
+        except Exception:
+            continue
+        sh = ustore.norm_shift(r.get("shift", ""))
+        if not sh:
+            continue
+        sig.add((d_iso, sh, str(r.get("note", "") or "")))
+    return sorted(sig)
+
+
+def _build_expected_signatures(
+    rows: list[dict],
+    doctor: str,
+    months: list[tuple[int, int]],
+) -> dict[tuple[int, int], list[tuple[str, str, str]]]:
+    """Build signatures as seen by the editor when doctor data is initially loaded."""
+    out: dict[tuple[int, int], list[tuple[str, str, str]]] = {}
+    for yy, mm in months:
+        existing = ustore.filter_doctor_month(rows, doctor, int(yy), int(mm))
+        out[(int(yy), int(mm))] = _month_entries_signature(existing)
+    return out
+
+
+def _detect_stale_doctor_month(
+    rows: list[dict],
+    doctor: str,
+    expected_signatures: dict[tuple[int, int], list[tuple[str, str, str]]],
+) -> str | None:
+    """Return stale month label (YYYY-MM) if persisted data changed after load."""
+    for (yy, mm), expected in sorted(expected_signatures.items(), key=lambda kv: (kv[0][0], kv[0][1])):
+        current_rows = ustore.filter_doctor_month(rows, doctor, int(yy), int(mm))
+        if _month_entries_signature(current_rows) != expected:
+            return f"{yy}-{mm:02d}"
+    return None
+
+
 def save_doctor_unavailability_with_retry(
     *,
     doctor: str,
@@ -231,6 +272,7 @@ def save_doctor_unavailability_with_retry(
     message: str,
     initial_rows: list[dict] | None = None,
     initial_sha: str | None = None,
+    expected_signatures: dict[tuple[int, int], list[tuple[str, str, str]]] | None = None,
     max_retries: int = 6,
 ) -> tuple[list[tuple[str, dict]], str | None]:
     """Concurrency-safe save for the shared GitHub CSV.
@@ -252,6 +294,15 @@ def save_doctor_unavailability_with_retry(
             store_sha = initial_sha
         else:
             store_rows, store_sha = load_store_from_github()
+
+        if expected_signatures:
+            stale_mk = _detect_stale_doctor_month(store_rows, doctor, expected_signatures)
+            if stale_mk:
+                raise RuntimeError(
+                    "Conflitto di aggiornamento: le tue indisponibilità "
+                    f"per {stale_mk} sono state modificate dopo il caricamento. "
+                    "Ricarica la pagina e riprova."
+                )
 
         new_rows = list(store_rows)
         audit_todo: list[tuple[str, dict]] = []
@@ -694,6 +745,8 @@ if mode == "Indisponibilità (Medico)":
         st.error(f"Errore accesso archivio indisponibilità: {e}")
         st.stop()
 
+    expected_signatures = _build_expected_signatures(store_rows, doctor, selected)
+
     # Load app settings (open/closed + limits)
     try:
         app_settings, _settings_sha = load_app_settings_from_github()
@@ -842,6 +895,7 @@ if mode == "Indisponibilità (Medico)":
                 message=f"Update unavailability: {doctor} ({updated_at})",
                 initial_rows=store_rows,
                 initial_sha=store_sha,
+                expected_signatures=expected_signatures,
                 max_retries=6,
             )
 
