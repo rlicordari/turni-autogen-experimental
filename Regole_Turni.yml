@@ -148,7 +148,7 @@ rules:
   H:
     monthly_quotas:
       Grimaldi_mon_fri: 2
-      Calabrò_mon_fri: 2
+      Calabrò_mon_fri: 1
     pool_mon_fri:
     - Licordari
     - Colarusso
