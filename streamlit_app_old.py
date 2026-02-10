@@ -6,9 +6,7 @@ import csv
 import json
 import requests
 import random
-import re
-import uuid
-from datetime import date, datetime, timezone, timedelta
+from datetime import date, datetime
 from pathlib import Path
 from collections.abc import Mapping
 
@@ -26,19 +24,6 @@ import turni_generator as tg
 
 APP_BUILD = "2026-02-01-ui-v7"
 
-# ---- Concurrency & session safety (doctor mode) ----
-# We implement a per-doctor "lease" file on GitHub:
-#   - new login overwrites the lease (kicking out previous sessions)
-#   - older sessions detect the mismatch and are forced to log out
-# Additionally, saves are optimistic-concurrency safe via GitHub SHA + retries
-# and are verified by a read-back signature check.
-
-DOCTOR_SESSION_TTL_MINUTES = 20
-DOCTOR_SESSION_CHECK_SECONDS = 5          # throttle for lease mismatch checks
-DOCTOR_SESSION_HEARTBEAT_SECONDS = 60     # throttle for lease keep-alive writes
-
-def _utc_now_iso() -> str:
-    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
 # ---- Indisponibilità: fasce ammesse e normalizzazione (per compatibilità con valori "storici") ----
 FASCIA_OPTIONS = ["Mattina", "Pomeriggio", "Notte", "Diurno", "Tutto il giorno"]
@@ -168,7 +153,6 @@ def _github_cfg() -> dict:
         "path": _get_secret(("GITHUB_UNAV_PATH",), "data/unavailability_store.csv"),
         "settings_path": _get_secret(("GITHUB_UNAV_SETTINGS_PATH",), "data/unavailability_settings.yml"),
         "audit_dir": _get_secret(("GITHUB_UNAV_AUDIT_DIR",), "data/unavailability_audit"),
-        "sessions_dir": _get_secret(("GITHUB_UNAV_SESSIONS_DIR",), "data/unavailability_sessions"),
     }
 
 # ---------------- Rules / doctors ----------------
@@ -202,10 +186,10 @@ def load_store_from_github() -> tuple[list[dict], str | None]:
         return [], None
     return ustore.load_store(gf.text), gf.sha
 
-def save_store_to_github(rows: list[dict], sha: str | None, message: str) -> str | None:
+def save_store_to_github(rows: list[dict], sha: str | None, message: str):
     g = _github_cfg()
     text = ustore.to_csv(rows)
-    resp = github_utils.put_file(
+    github_utils.put_file(
         owner=g["owner"],
         repo=g["repo"],
         path=g["path"],
@@ -215,13 +199,6 @@ def save_store_to_github(rows: list[dict], sha: str | None, message: str) -> str
         message=message,
         text=text,
     )
-    try:
-        content = resp.get("content") if isinstance(resp, dict) else None
-        if isinstance(content, dict) and content.get("sha"):
-            return str(content.get("sha"))
-    except Exception:
-        pass
-    return None
 
 
 def _is_sha_conflict_error(err: Exception) -> bool:
@@ -246,158 +223,6 @@ def _is_sha_conflict_error(err: Exception) -> bool:
     return False
 
 
-# ---------------- Doctor session lease (GitHub) ----------------
-def _doctor_slug(doctor: str) -> str:
-    """Filesystem-like slug for a doctor name."""
-    s = (doctor or "").strip().lower()
-    s = re.sub(r"\s+", "_", s)
-    s = re.sub(r"[^a-z0-9_\-]", "", s)
-    return s or "doctor"
-
-
-def _session_lease_path(doctor: str) -> str:
-    g = _github_cfg()
-    sessions_dir = (g.get("sessions_dir") or "data/unavailability_sessions").rstrip("/")
-    return f"{sessions_dir}/lease_{_doctor_slug(doctor)}.json"
-
-
-def _parse_utc_iso(ts: str) -> datetime | None:
-    s = str(ts or "").strip()
-    if not s:
-        return None
-    # support ...Z
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    try:
-        return datetime.fromisoformat(s)
-    except Exception:
-        return None
-
-
-def load_session_lease_from_github(doctor: str) -> tuple[dict | None, str | None]:
-    g = _github_cfg()
-    path = _session_lease_path(doctor)
-    gf = github_utils.get_file(
-        owner=g["owner"],
-        repo=g["repo"],
-        path=path,
-        token=g["token"],
-        branch=g.get("branch", "main"),
-    )
-    if gf is None:
-        return None, None
-    try:
-        data = json.loads(gf.text or "{}")
-        if isinstance(data, dict):
-            return data, gf.sha
-    except Exception:
-        pass
-    return None, gf.sha
-
-
-def save_session_lease_to_github(doctor: str, lease: dict, sha: str | None, message: str) -> str | None:
-    g = _github_cfg()
-    path = _session_lease_path(doctor)
-    text = json.dumps(lease, ensure_ascii=False, indent=2)
-    resp = github_utils.put_file(
-        owner=g["owner"],
-        repo=g["repo"],
-        path=path,
-        token=g["token"],
-        branch=g.get("branch", "main"),
-        sha=sha,
-        message=message,
-        text=text,
-    )
-    try:
-        content = resp.get("content") if isinstance(resp, dict) else None
-        if isinstance(content, dict) and content.get("sha"):
-            return str(content.get("sha"))
-    except Exception:
-        pass
-    return None
-
-
-def _lease_is_expired(lease: dict | None, now_utc: datetime) -> bool:
-    if not isinstance(lease, dict):
-        return True
-    exp = _parse_utc_iso(lease.get("expires_at"))
-    if exp is not None:
-        try:
-            exp_naive = exp.astimezone(timezone.utc).replace(tzinfo=None) if exp.tzinfo else exp
-        except Exception:
-            exp_naive = exp.replace(tzinfo=None)
-        return exp_naive <= now_utc
-    # fallback: last_seen + TTL
-    last_seen = _parse_utc_iso(lease.get("last_seen") or lease.get("issued_at"))
-    if last_seen is None:
-        return True
-    try:
-        age_s = (now_utc - (last_seen.astimezone(timezone.utc).replace(tzinfo=None) if last_seen.tzinfo else last_seen)).total_seconds()
-    except Exception:
-        return True
-    return age_s > (DOCTOR_SESSION_TTL_MINUTES * 60)
-
-
-def acquire_doctor_session_lease(
-    *,
-    doctor: str,
-    session_id: str,
-    max_retries: int = 6,
-) -> tuple[dict, str | None]:
-    """Acquire/overwrite the lease for this doctor (kicking out other sessions).
-
-    Uses optimistic concurrency with retries on SHA conflicts.
-    """
-    last_err: Exception | None = None
-    for attempt in range(max_retries):
-        lease, sha = load_session_lease_from_github(doctor)
-
-        now_utc = datetime.utcnow()
-        expires_at = (now_utc.timestamp() + DOCTOR_SESSION_TTL_MINUTES * 60)
-        expires_dt = datetime.utcfromtimestamp(expires_at)
-
-        new_lease = {
-            "doctor": (doctor or "").strip(),
-            "session_id": session_id,
-            "issued_at": lease.get("issued_at") if isinstance(lease, dict) and lease.get("session_id") == session_id else _utc_now_iso(),
-            "last_seen": _utc_now_iso(),
-            "expires_at": expires_dt.isoformat(timespec="seconds") + "Z",
-            "app_build": APP_BUILD,
-        }
-
-        try:
-            new_sha = save_session_lease_to_github(
-                doctor,
-                new_lease,
-                sha,
-                message=f"Lease doctor session: {doctor} ({new_lease['last_seen']})",
-            )
-            return new_lease, new_sha
-        except Exception as e:
-            last_err = e
-            if _is_sha_conflict_error(e):
-                time.sleep(min(1.6, 0.25 * (2 ** attempt) + random.random() * 0.2))
-                continue
-            raise
-
-    if last_err:
-        raise last_err
-    raise RuntimeError("Errore lease sessione medico: tentativi esauriti.")
-
-
-def check_doctor_session_lease(doctor: str, session_id: str) -> bool:
-    """Return True if the current lease belongs to this session (and is not expired)."""
-    lease, _sha = load_session_lease_from_github(doctor)
-    now_utc = datetime.utcnow()
-    if _lease_is_expired(lease, now_utc):
-        # Treat expired as "free": current session can re-acquire on next action.
-        return True
-    if not isinstance(lease, dict):
-        return True
-    return str(lease.get("session_id") or "") == str(session_id or "")
-
-
 def _month_entries_signature(rows: list[dict]) -> list[tuple[str, str, str]]:
     """Return a deterministic signature for month rows: (date, shift, note)."""
     sig: set[tuple[str, str, str]] = set()
@@ -410,19 +235,6 @@ def _month_entries_signature(rows: list[dict]) -> list[tuple[str, str, str]]:
         if not sh:
             continue
         sig.add((d_iso, sh, str(r.get("note", "") or "")))
-    return sorted(sig)
-
-
-def _entries_signature_from_tuples(entries: list[tuple[date, str, str]]) -> list[tuple[str, str, str]]:
-    """Signature for a list of (date, shift, note)."""
-    sig: set[tuple[str, str, str]] = set()
-    for d, sh, note in (entries or []):
-        if not isinstance(d, date):
-            continue
-        sh2 = ustore.norm_shift(sh)
-        if not sh2:
-            continue
-        sig.add((d.isoformat(), sh2, str(note or "")))
     return sorted(sig)
 
 
@@ -507,21 +319,8 @@ def save_doctor_unavailability_with_retry(
             )
 
         try:
-            _new_sha = save_store_to_github(new_rows, store_sha, message=message)
-
-            # Read-back verification: only show "Saved" if the persisted store
-            # matches the entries we intended to write for each month.
-            latest_rows, latest_sha = load_store_from_github()
-            for (yy, mm), entries_norm in months:
-                yy_i, mm_i = int(yy), int(mm)
-                persisted = ustore.filter_doctor_month(latest_rows, doctor, yy_i, mm_i)
-                if _month_entries_signature(persisted) != _entries_signature_from_tuples(entries_norm):
-                    raise RuntimeError(
-                        "Salvataggio non verificato: i dati sul server non corrispondono a quanto inserito. "
-                        "Ricarica e riprova."
-                    )
-
-            return audit_todo, (latest_sha or _new_sha)
+            save_store_to_github(new_rows, store_sha, message=message)
+            return audit_todo, store_sha
         except Exception as e:
             last_err = e
             if _is_sha_conflict_error(e):
@@ -826,138 +625,6 @@ def extract_entries_from_editor(edited_rows: list[dict], yy: int, mm: int) -> tu
     return entries2, {"invalid_date": invalid_date, "out_of_month": out_of_month, "counts": counts}
 
 
-# ---------------- Medico UX: baseline snapshot + session guard ----------------
-_BASELINE_SS_KEY = "unav_store_baseline"
-
-
-def get_or_load_doctor_baseline(
-    doctor: str,
-    selected_months: list[tuple[int, int]],
-    force_reload: bool = False,
-) -> dict:
-    """Return a stable baseline snapshot for the current editing session.
-
-    The baseline is anchored in st.session_state, so we can reliably detect
-    stale edits (same doctor/month saved elsewhere) at save-time.
-    """
-    doctor = (doctor or "").strip()
-    selected_key = tuple((int(y), int(m)) for (y, m) in (selected_months or []))
-
-    cur = st.session_state.get(_BASELINE_SS_KEY)
-    if (
-        (not force_reload)
-        and isinstance(cur, dict)
-        and cur.get("doctor") == doctor
-        and tuple(cur.get("selected") or ()) == selected_key
-        and isinstance(cur.get("expected_signatures"), dict)
-    ):
-        return cur
-
-    rows, sha = load_store_from_github()
-    expected = _build_expected_signatures(rows, doctor, list(selected_key))
-    new = {
-        "doctor": doctor,
-        "selected": selected_key,
-        "rows": rows,
-        "sha": sha,
-        "expected_signatures": expected,
-        "loaded_at": _utc_now_iso(),
-    }
-    st.session_state[_BASELINE_SS_KEY] = new
-    return new
-
-
-def clear_doctor_baseline():
-    st.session_state.pop(_BASELINE_SS_KEY, None)
-
-
-def _logout_doctor(reason: str):
-    # Keep editor keys in session_state (draft), but require re-login.
-    st.session_state["doctor_auth_ok"] = False
-    st.session_state["doctor_name"] = None
-    st.session_state["doctor_logout_msg"] = reason
-    st.rerun()
-
-
-def _doctor_session_state_key(doctor: str) -> str:
-    return f"doctor_session::{_doctor_slug(doctor)}"
-
-
-def ensure_doctor_session_active(doctor: str) -> str:
-    """Single-session guard per doctor.
-
-    - On first entry: acquires/overwrites the GitHub lease (kicking out other sessions)
-    - On subsequent reruns: throttled check for lease mismatch → forced logout
-    - Heartbeat: periodically refreshes last_seen/expires_at on GitHub
-    """
-    doctor = (doctor or "").strip()
-    ss_key = _doctor_session_state_key(doctor)
-    now_ts = time.time()
-
-    cur = st.session_state.get(ss_key)
-    if not isinstance(cur, dict):
-        cur = {
-            "session_id": str(uuid.uuid4()),
-            "lease_acquired": False,
-            "last_check_ts": 0.0,
-            "last_heartbeat_ts": 0.0,
-        }
-        st.session_state[ss_key] = cur
-
-    session_id = str(cur.get("session_id") or "")
-    if not session_id:
-        session_id = str(uuid.uuid4())
-        cur["session_id"] = session_id
-
-    # Acquire once (overwrite existing lease) → this kicks out any other session.
-    if not bool(cur.get("lease_acquired")):
-        acquire_doctor_session_lease(doctor=doctor, session_id=session_id)
-        cur["lease_acquired"] = True
-        cur["last_check_ts"] = now_ts
-        cur["last_heartbeat_ts"] = now_ts
-        st.session_state[ss_key] = cur
-        return session_id
-
-    # Throttled check (avoid spamming GitHub on every data_editor rerun).
-    if (now_ts - float(cur.get("last_check_ts") or 0.0)) >= DOCTOR_SESSION_CHECK_SECONDS:
-        cur["last_check_ts"] = now_ts
-        st.session_state[ss_key] = cur
-        ok = check_doctor_session_lease(doctor, session_id)
-        if not ok:
-            _logout_doctor(
-                "Sessione terminata: hai effettuato accesso dallo stesso utente su un altro dispositivo/browser."
-            )
-            st.stop()
-
-    # Heartbeat to keep the lease alive (and also detects network/token issues).
-    if (now_ts - float(cur.get("last_heartbeat_ts") or 0.0)) >= DOCTOR_SESSION_HEARTBEAT_SECONDS:
-        acquire_doctor_session_lease(doctor=doctor, session_id=session_id)
-        cur["last_heartbeat_ts"] = now_ts
-        st.session_state[ss_key] = cur
-
-    return session_id
-
-
-def release_doctor_session(doctor: str):
-    """Best-effort: mark the lease as expired when the doctor logs out."""
-    doctor = (doctor or "").strip()
-    ss_key = _doctor_session_state_key(doctor)
-    cur = st.session_state.get(ss_key)
-    if not isinstance(cur, dict):
-        return
-    session_id = str(cur.get("session_id") or "")
-    if not session_id:
-        return
-    try:
-        lease, sha = load_session_lease_from_github(doctor)
-        if isinstance(lease, dict) and str(lease.get("session_id") or "") == session_id:
-            lease["expires_at"] = _utc_now_iso()
-            lease["last_seen"] = _utc_now_iso()
-            save_session_lease_to_github(doctor, lease, sha, message=f"Release doctor session: {doctor}")
-    except Exception:
-        pass
-
-
 # ---------------- UI: Header ----------------
 st.title("Turni UTIC – Autogeneratore")
 st.markdown(
@@ -996,27 +663,12 @@ if mode == "Indisponibilità (Medico)":
         st.session_state.doctor_auth_ok = False
         st.session_state.doctor_name = None
 
-    # If this browser session was kicked out by a newer login elsewhere, show the reason.
-    if st.session_state.get("doctor_logout_msg"):
-        st.warning(str(st.session_state.pop("doctor_logout_msg")))
-
     if st.session_state.doctor_auth_ok:
         st.success(f"Accesso attivo: **{st.session_state.doctor_name}**")
         if st.button("Esci / cambia medico"):
-            old_doctor = str(st.session_state.doctor_name or "")
-            try:
-                release_doctor_session(old_doctor)
-            except Exception:
-                pass
             st.session_state.doctor_auth_ok = False
             st.session_state.doctor_name = None
             st.session_state.pop("doctor_selected_months", None)
-            clear_doctor_baseline()
-            # clear session guard state for safety
-            try:
-                st.session_state.pop(_doctor_session_state_key(old_doctor), None)
-            except Exception:
-                pass
             # cancella anche eventuali editor keys (non obbligatorio)
             st.rerun()
 
@@ -1032,12 +684,6 @@ if mode == "Indisponibilità (Medico)":
         if go:
             expected = str(pins.get(doctor, ""))
             if pin and pin == expected:
-                clear_doctor_baseline()
-                # reset any previous lease state for this doctor in this browser
-                try:
-                    st.session_state.pop(_doctor_session_state_key(doctor), None)
-                except Exception:
-                    pass
                 st.session_state.doctor_auth_ok = True
                 st.session_state.doctor_name = doctor
                 st.rerun()
@@ -1047,14 +693,6 @@ if mode == "Indisponibilità (Medico)":
         st.stop()
 
     doctor = st.session_state.doctor_name
-
-    # Single active session per doctor: this prevents silent overwrites when the
-    # same doctor uses multiple devices/browsers.
-    try:
-        _doctor_session_id = ensure_doctor_session_active(doctor)
-    except Exception as e:
-        st.error(f"Errore gestione sessione: {e}")
-        st.stop()
 
     # ---- Selezione mesi da compilare (Anno + Mese separati) ----
     today = date.today()
@@ -1100,32 +738,14 @@ if mode == "Indisponibilità (Medico)":
 
     label_map = {(yy, mm): f"{yy}-{mm:02d}" for (yy, mm) in selected}
 
-    # Stable baseline (snapshot) for this editing session.
-    # This is what we compare against at save-time to detect a stale editor.
-    cR1, cR2 = st.columns([1, 3])
-    with cR1:
-        refresh_baseline = st.button(
-            "🔄 Ricarica dati",
-            help="Ricarica l’archivio dal server (utile se qualcuno ha appena salvato).",
-        )
-    with cR2:
-        st.caption("La sessione usa uno snapshot per evitare conflitti: al salvataggio viene sempre verificato sul server.")
-
-    if refresh_baseline:
-        # Reset baseline + editors so the UI reflects the latest server state.
-        clear_doctor_baseline()
-        for (yy, mm) in selected:
-            st.session_state.pop(f"unav_editor_{doctor}_{yy}_{mm}", None)
-        st.rerun()
-
+    # Load store after auth (so we don't hit GitHub before login)
     try:
-        baseline = get_or_load_doctor_baseline(doctor, selected, force_reload=bool(refresh_baseline))
-        store_rows = list(baseline.get("rows") or [])
-        store_sha = baseline.get("sha")
-        expected_signatures = dict(baseline.get("expected_signatures") or {})
+        store_rows, store_sha = load_store_from_github()
     except Exception as e:
         st.error(f"Errore accesso archivio indisponibilità: {e}")
         st.stop()
+
+    expected_signatures = _build_expected_signatures(store_rows, doctor, selected)
 
     # Load app settings (open/closed + limits)
     try:
@@ -1246,25 +866,6 @@ if mode == "Indisponibilità (Medico)":
             st.error("Inserimento indisponibilità chiuso dall'amministratore: non è possibile salvare.")
             st.stop()
 
-        # Force a lease ownership check right before saving (no throttle).
-        try:
-            _ss_key = _doctor_session_state_key(doctor)
-            _cur = st.session_state.get(_ss_key) if isinstance(st.session_state.get(_ss_key), dict) else {}
-            _sid = str((_cur or {}).get("session_id") or "")
-            if not _sid:
-                # Should not happen, but be safe.
-                _sid = ensure_doctor_session_active(doctor)
-            if not check_doctor_session_lease(doctor, _sid):
-                _logout_doctor(
-                    "Impossibile salvare: la sessione è stata sostituita da un accesso dello stesso utente da un altro dispositivo/browser."
-                )
-                st.stop()
-            # refresh lease timestamp so an in-progress save won't appear "expired"
-            acquire_doctor_session_lease(doctor=doctor, session_id=_sid)
-        except Exception as e:
-            st.error(f"Errore verifica sessione prima del salvataggio: {e}")
-            st.stop()
-
         # Server-side re-check (in caso di race / rerun)
         hard_viol = []
         for (yy, mm), entries_norm in (normalized_entries_by_month or {}).items():
@@ -1317,10 +918,6 @@ if mode == "Indisponibilità (Medico)":
                     append_unavailability_audit_log(mk_audit, audit_row)
                 except Exception as e:
                     st.warning(f"Audit log non aggiornato per {mk_audit}: {e}")
-
-            # After a successful save, refresh our baseline snapshot so next saves
-            # don't trigger false "stale" conflicts.
-            clear_doctor_baseline()
 
             st.success("Salvato ✅")
             st.rerun()
